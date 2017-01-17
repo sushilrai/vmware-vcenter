@@ -116,6 +116,8 @@ Puppet::Type.type(:vc_dvswitch).provide(:vc_dvswitch, :parent => Puppet::Provide
     rescue Exception => e
       if e.message.match(/AlreadyExists:/i)
         Puppet.debug('Host already added to DVS')
+      elsif e.message.match(/The object or item referred to could not be found/i)
+        Puppet.debug("VDS resource is already removed. Received error message %s" % [e.message])
       else
         fail "#{e.message}"
       end
