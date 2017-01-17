@@ -3,6 +3,8 @@ require File.join(provider_path, 'vcenter')
 require 'rbvmomi'
 require File.join(provider_path, 'vsanmgmt.api')
 
+MAX_CAPACITY_DISKS = 7
+
 Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :parent => Puppet::Provider::Vcenter) do
   @doc = "Initialize VSAN Disk for cluster node"
 
@@ -22,7 +24,30 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     while !hosts_task_info.keys.empty? do
       hosts_task_info.each do |host_name, task|
         Puppet.debug("Task status for host #{host_name} is #{task.info.state}")
-        hosts_task_info.delete(host_name) if task.info.state != "running"
+        if task.info.state != "running"
+          Puppet.debug("Server %s, Disk initialization status %s" % [host_name, task.info])
+          hosts_task_info.delete(host_name)
+        end
+      end
+      sleep(60) unless hosts_task_info.empty?
+    end
+
+    # Check if there is any disk left out for the cluster host
+    cluster_hosts.each do |host|
+      hosts_task_info[host.name] = initialize_spare_disk(host)
+    end
+
+    Puppet.debug("Hosts task info %s " % [hosts_task_info])
+    hosts_task_info.keys.collect { |x| hosts_task_info.delete(x) if hosts_task_info[x].nil? }
+
+    while !hosts_task_info.keys.empty? do
+      hosts_task_info.each do |host_name, task|
+        next if task.nil?
+        Puppet.debug("Task status for host #{host_name} is #{task.info.state}")
+        if task.info.state != "running"
+          Puppet.debug("Server %s, Disk re-initialization status %s" % [host_name, task.info])
+          hosts_task_info.delete(host_name)
+        end
       end
       sleep(60) unless hosts_task_info.empty?
     end
@@ -101,9 +126,20 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     # Sort disk based on the size
     vsandisks.sort! {|x| x.disk.capacity.block }
     vsandisks.each do |vsandisk|
-      next if vsandisk.disk.displayName.match(/usb/i)
-      next if ["inUse", "ineligible"].include?(vsandisk.state)
-      next if vsandisk.disk.displayName =~ /ATA/i && resource[:vsan_disk_group_creation_type].to_s == "hybrid"
+      if vsandisk.disk.displayName.match(/usb/i)
+        Puppet.debug("Skipping USB disk %s for server %s " % [vsandisk, host.name])
+        next
+      end
+
+      if ["inUse", "ineligible"].include?(vsandisk.state)
+        Puppet.debug("Skipping in-use or in-eligible disk %s for server %s" % [vsandisk, host.name])
+        next
+      end
+
+      if vsandisk.disk.displayName =~ /ATA/i && resource[:vsan_disk_group_creation_type].to_s == "hybrid"
+        Puppet.debug("Skipping local ATA disk %s for server %s in case of hybrid deployent" % [vsandisk, host.name])
+        next
+      end
 
       if vsandisk.disk.ssd
         ssd.push(vsandisk.disk)
@@ -113,6 +149,8 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     end
     return true if ssd.empty?
     diskspec = RbVmomi::VIM::VimVsanHostDiskMappingCreationSpec.new()
+    Puppet.debug("Server: %s SSD Disks: %s" % [host.name, ssd])
+    Puppet.debug("Server: %s Non-SSD Disks:  %s" % [host.name, nonssd])
 
     case resource[:vsan_disk_group_creation_type].to_s
       when "hybrid"
@@ -138,7 +176,104 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     diskspec.host = host
     diskm = RbVmomi::VIM::VimClusterVsanVcDiskManagementSystem(hsconn, 'vsan-disk-management-system')
     vsan_task = diskm.InitializeDiskMappings(:spec => diskspec)
+    Puppet.debug("Server: %s, Disk Spec: %s" % [host.name, diskspec])
     RbVmomi::VIM::Task(vim, vsan_task._ref )
+  end
+
+  def initialize_spare_disk(host)
+    vsansys = host.configManager.vsanSystem
+    vsandisks =  vsansys.QueryDisksForVsan()
+    ssd = []
+    nonssd = []
+    # Sort disk based on the size
+    vsandisks.sort! {|x| x.disk.capacity.block }
+    vsandisks.each do |vsandisk|
+      if vsandisk.disk.displayName.match(/usb/i)
+        Puppet.debug("Skipping USB disk %s for server %s " % [vsandisk, host.name])
+        next
+      end
+
+      if ["inUse", "ineligible"].include?(vsandisk.state)
+        Puppet.debug("Skipping in-use or in-eligible disk %s for server %s" % [vsandisk, host.name])
+        next
+      end
+
+      if vsandisk.disk.displayName =~ /ATA/i && resource[:vsan_disk_group_creation_type].to_s == "hybrid"
+        Puppet.debug("Skipping local ATA disk %s for server %s in case of hybrid deployent" % [vsandisk, host.name])
+        next
+      end
+
+      if vsandisk.disk.ssd
+        ssd.push(vsandisk.disk)
+      else
+        nonssd.push(vsandisk.disk)
+      end
+    end
+
+    diskspec = RbVmomi::VIM::VimVsanHostDiskMappingCreationSpec.new()
+    Puppet.debug("Server: %s SSD Disks: %s" % [host.name, ssd])
+    Puppet.debug("Server: %s Non-SSD Disks:  %s" % [host.name, nonssd])
+
+    # If there is no SSD or non-SSD disk then no need to perform anything
+    if ssd.empty? && nonssd.empty?
+      Puppet.debug("There is no free disk for server %s" % [host.name])
+      return nil
+    end
+
+    disk_group_capacity = current_disk_group_capacity(host)
+    case resource[:vsan_disk_group_creation_type].to_s
+      when "hybrid"
+        if ssd.empty? && !nonssd.empty?
+          if current_disk_group_capacity(host) <= nonssd.size
+            diskspec.capacityDisks = nonssd
+          else
+            # Will try to consume possible disks and leave rest of the disks
+            diskspec.capacityDisks = nonssd[0..disk_group_capacity - 1]
+          end
+        elsif !ssd.empty?
+          diskspec.cacheDisks = ssd
+          diskspec.capacityDisks = nonssd
+        end
+        diskspec.creationType = "hybrid"
+
+      when "allFlash"
+        # Check the capacity available in existing disk-groups and try to include it
+        # If existing capacity is not sufficient then create new disk-group
+
+        if disk_group_capacity <= ssd.size
+          diskspec.capacityDisks = ssd
+        else
+          ssd.sort! {|x| x.capacity.block }
+          disk_sizes = ssd.collect {|x| x.capacity.block }.sort.uniq
+          if disk_sizes.size == 1
+            ssd.each_slice(8).to_a.each do |ssd_group|
+              diskspec.cacheDisks = [ssd_group[0]]
+              diskspec.capacityDisks = ssd_group[1..ssd_group.size-1]
+            end
+          else
+            cache_disks = ssd.find_all {|x| x.capacity.block == disk_sizes[0]}
+            capacity_disks = ssd.reject {|x| x.capacity.block == disk_sizes[0]}
+            diskspec.cacheDisks = cache_disks
+            diskspec.capacityDisks = capacity_disks
+          end
+          diskspec.creationType = "allFlash"
+        end
+    end
+
+    diskspec.host = host
+    diskm = RbVmomi::VIM::VimClusterVsanVcDiskManagementSystem(hsconn, 'vsan-disk-management-system')
+    vsan_task = diskm.InitializeDiskMappings(:spec => diskspec)
+    Puppet.debug("Server: %s, Disk Spec: %s" % [host.name, diskspec])
+    RbVmomi::VIM::Task(vim, vsan_task._ref )
+  end
+
+  def current_disk_group_capacity(host)
+    disk_group_capacity_size = 0
+    local_disk_mappings = disk_mappings(host)
+    local_disk_mappings.each do |disk_group|
+      disk_group_capacity_size += disk_group.mapping.nonSsd.size
+    end
+    local_disk_mappings.size * 7 - disk_group_capacity_size
   end
 
   def creation_type(non_ssd)
