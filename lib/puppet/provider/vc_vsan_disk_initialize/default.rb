@@ -24,7 +24,7 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     host_disk_group_creation_initiated = hosts_task_info.keys
     while !hosts_task_info.keys.empty? do
       hosts_task_info.reject! do |host_name, task|
-        Puppet.debug("Task status for host #{host_name} is #{task.info.inspect}")
+        Puppet.debug("Task status for host %s is %s" % [host_name, task.info.state])
         task.info.state != "running"
       end
 
@@ -43,7 +43,7 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
 
     while !hosts_task_info.keys.empty? do
       hosts_task_info.reject! do |host_name, task|
-        Puppet.debug("Task status for host #{host_name} is #{task.info.inspect}")
+        Puppet.debug("Task status for host %s is %s" % [host_name, task.info.state])
         task.info.state != "running"
       end
 
