@@ -21,34 +21,32 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
       end
     end
 
+    host_disk_group_creation_initiated = hosts_task_info.keys
     while !hosts_task_info.keys.empty? do
-      hosts_task_info.each do |host_name, task|
-        Puppet.debug("Task status for host #{host_name} is #{task.info.state}")
-        if task.info.state != "running"
-          Puppet.debug("Server %s, Disk initialization status %s" % [host_name, task.info])
-          hosts_task_info.delete(host_name)
-        end
+      hosts_task_info.reject! do |host_name, task|
+        Puppet.debug("Task status for host #{host_name} is #{task.info.inspect}")
+        task.info.state != "running"
       end
+
       sleep(60) unless hosts_task_info.empty?
     end
 
     # Check if there is any disk left out for the cluster host
+    hosts_task_info = {}
     cluster_hosts.each do |host|
+      next unless host_disk_group_creation_initiated.include?(host.name)
       hosts_task_info[host.name] = initialize_spare_disk(host)
     end
 
     Puppet.debug("Hosts task info %s " % [hosts_task_info])
-    hosts_task_info.keys.collect { |x| hosts_task_info.delete(x) if hosts_task_info[x].nil? }
+    hosts_task_info.reject! { |k, v| v.nil? }
 
     while !hosts_task_info.keys.empty? do
-      hosts_task_info.each do |host_name, task|
-        next if task.nil?
-        Puppet.debug("Task status for host #{host_name} is #{task.info.state}")
-        if task.info.state != "running"
-          Puppet.debug("Server %s, Disk re-initialization status %s" % [host_name, task.info])
-          hosts_task_info.delete(host_name)
-        end
+      hosts_task_info.reject! do |host_name, task|
+        Puppet.debug("Task status for host #{host_name} is #{task.info.inspect}")
+        task.info.state != "running"
       end
+
       sleep(60) unless hosts_task_info.empty?
     end
 
@@ -118,6 +116,25 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     conn
   end
 
+  def should_skip_vsan_disk?(vsandisk, host)
+    if vsandisk.disk.displayName.match(/usb/i)
+      Puppet.debug("Skipping USB disk %s for server %s " % [vsandisk, host.name])
+      return true
+    end
+
+    if ["inUse", "ineligible"].include?(vsandisk.state)
+      Puppet.debug("Skipping in-use or in-eligible disk %s for server %s" % [vsandisk, host.name])
+      return true
+    end
+
+    if vsandisk.disk.displayName =~ /ATA/i && resource[:vsan_disk_group_creation_type].to_s == "hybrid"
+      Puppet.debug("Skipping local ATA disk %s for server %s in case of hybrid deployment" % [vsandisk, host.name])
+      return true
+    end
+
+    false
+  end
+
   def initialize_disk(host)
     vsansys = host.configManager.vsanSystem
     vsandisks =  vsansys.QueryDisksForVsan()
@@ -126,20 +143,8 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     # Sort disk based on the size
     vsandisks.sort! {|x| x.disk.capacity.block }
     vsandisks.each do |vsandisk|
-      if vsandisk.disk.displayName.match(/usb/i)
-        Puppet.debug("Skipping USB disk %s for server %s " % [vsandisk, host.name])
-        next
-      end
 
-      if ["inUse", "ineligible"].include?(vsandisk.state)
-        Puppet.debug("Skipping in-use or in-eligible disk %s for server %s" % [vsandisk, host.name])
-        next
-      end
-
-      if vsandisk.disk.displayName =~ /ATA/i && resource[:vsan_disk_group_creation_type].to_s == "hybrid"
-        Puppet.debug("Skipping local ATA disk %s for server %s in case of hybrid deployent" % [vsandisk, host.name])
-        next
-      end
+      next if should_skip_vsan_disk?(vsandisk, host)
 
       if vsandisk.disk.ssd
         ssd.push(vsandisk.disk)
@@ -160,11 +165,15 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
       when "allFlash"
         ssd.sort! {|x| x.capacity.block }
         disk_sizes = ssd.collect {|x| x.capacity.block }.sort.uniq
+        cacheDisks = []
+        capacityDisks = []
         if disk_sizes.size == 1
           ssd.each_slice(8).to_a.each do |ssd_group|
-            diskspec.cacheDisks = [ssd_group[0]]
-            diskspec.capacityDisks = ssd_group[1..ssd_group.size-1]
+            cacheDisks << ssd_group[0]
+            capacityDisks.push(*ssd_group[1..ssd_group.size-1])
           end
+          diskspec.cacheDisks = cacheDisks
+          diskspec.capacityDisks = capacityDisks
         else
           cache_disks = ssd.find_all {|x| x.capacity.block == disk_sizes[0]}
           capacity_disks = ssd.reject {|x| x.capacity.block == disk_sizes[0]}
@@ -188,20 +197,8 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     # Sort disk based on the size
     vsandisks.sort! {|x| x.disk.capacity.block }
     vsandisks.each do |vsandisk|
-      if vsandisk.disk.displayName.match(/usb/i)
-        Puppet.debug("Skipping USB disk %s for server %s " % [vsandisk, host.name])
-        next
-      end
 
-      if ["inUse", "ineligible"].include?(vsandisk.state)
-        Puppet.debug("Skipping in-use or in-eligible disk %s for server %s" % [vsandisk, host.name])
-        next
-      end
-
-      if vsandisk.disk.displayName =~ /ATA/i && resource[:vsan_disk_group_creation_type].to_s == "hybrid"
-        Puppet.debug("Skipping local ATA disk %s for server %s in case of hybrid deployent" % [vsandisk, host.name])
-        next
-      end
+      next if should_skip_vsan_disk?(vsandisk, host)
 
       if vsandisk.disk.ssd
         ssd.push(vsandisk.disk)
@@ -224,7 +221,7 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     case resource[:vsan_disk_group_creation_type].to_s
       when "hybrid"
         if ssd.empty? && !nonssd.empty?
-          if current_disk_group_capacity(host) <= nonssd.size
+          if disk_group_capacity <= nonssd.size
             diskspec.capacityDisks = nonssd
           else
             # Will try to consume possible disks and leave rest of the disks
@@ -240,16 +237,20 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
         # Check the capacity available in existing disk-groups and try to include it
         # If existing capacity is not sufficient then create new disk-group
 
-        if disk_group_capacity <= ssd.size
+        if ssd.size <= disk_group_capacity
           diskspec.capacityDisks = ssd
         else
           ssd.sort! {|x| x.capacity.block }
           disk_sizes = ssd.collect {|x| x.capacity.block }.sort.uniq
+          cacheDisks = []
+          capacityDisks = []
           if disk_sizes.size == 1
             ssd.each_slice(8).to_a.each do |ssd_group|
-              diskspec.cacheDisks = [ssd_group[0]]
-              diskspec.capacityDisks = ssd_group[1..ssd_group.size-1]
+              cacheDisks << ssd_group[0]
+              capacityDisks.push(*ssd_group[1..ssd_group.size-1])
             end
+            diskspec.cacheDisks = cacheDisks
+            diskspec.capacityDisks = capacityDisks
           else
             cache_disks = ssd.find_all {|x| x.capacity.block == disk_sizes[0]}
             capacity_disks = ssd.reject {|x| x.capacity.block == disk_sizes[0]}
@@ -273,7 +274,7 @@ Puppet::Type.type(:vc_vsan_disk_initialize).provide(:vc_vsan_disk_initialize, :p
     local_disk_mappings.each do |disk_group|
       disk_group_capacity_size += disk_group.mapping.nonSsd.size
     end
-    local_disk_mappings.size * 7 - disk_group_capacity_size
+    local_disk_mappings.size * MAX_CAPACITY_DISKS - disk_group_capacity_size
   end
 
   def creation_type(non_ssd)
